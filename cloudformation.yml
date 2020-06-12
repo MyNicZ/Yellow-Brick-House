@@ -1,0 +1,210 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: "build-account.pipeline.side8"
+Parameters:
+  Environment:
+    Type: String
+
+  Side8Id:
+    Type: String
+
+  DeploymentAccountArns:
+    Type: String
+    Description: "Account ARNs (eg: arn:aws:iam::1234567:root) granted access to built artifacts"
+    AllowedPattern: '^(arn:aws:iam::\d+:root(,(?!$))?)+$'
+    ConstraintDescription: "Must be a comma separated list of account ARNs (arn:aws:iam::1234567:root)"
+
+  AccountId:
+    Type: String
+
+Conditions:
+  AccountsMatch: !Equals
+    - !Ref AccountId
+    - !Ref AWS::AccountId
+
+Resources:
+  Side8PipelineIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub side8.pipeline.build.${Side8Id}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            AWS: arn:aws:iam::265928549752:root
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              sts:ExternalId: !Ref Side8Id
+      Policies:
+        - PolicyName: codebuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - "logs:GetLogEvents"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${CodeBuildProject}:log-stream:*'
+        - PolicyName: S3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub ${ArtifactS3Bucket.Arn}/cache/*
+                  - !Sub ${ArtifactS3Bucket.Arn}/source/*
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource: !GetAtt ArtifactS3Bucket.Arn
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  ArtifactS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub side8.pipeline.artifacts.${Side8Id}
+
+  ArtifactS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "s3:GetObject"
+              - "s3:ListBucket"
+            Effect: "Allow"
+            Resource:
+              - !Sub ${ArtifactS3Bucket.Arn}/*
+              - !GetAtt ArtifactS3Bucket.Arn
+            Principal:
+              AWS: !Split [",", !Ref DeploymentAccountArns]
+
+  CodeBuildProjectIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: artifact-storage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactS3Bucket}/*'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+
+  CodeBuildProjectIamPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: logging
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${CodeBuildProject}'
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${CodeBuildProject}:*'
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+      Roles:
+        - !Ref CodeBuildProjectIamRole
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub side8_pipeline_build_${Side8Id}
+      Artifacts:
+        EncryptionDisabled: true
+        Type: S3
+        Location: !Ref ArtifactS3Bucket
+        Name: output
+        NamespaceType: BUILD_ID
+        Packaging: NONE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+      ServiceRole: !GetAtt CodeBuildProjectIamRole.Arn
+      Source:
+        Type: GITHUB
+        Location: https://github.com/side8/hello-pipeline.git
+        BuildSpec: .s8/buildspec.yml
+
+  AccountsMatch:
+    Type: Custom::AccountsMatch
+    Properties:
+      ServiceToken: !GetAtt FailFalseLambdaFunction.Arn
+      Boolean: !If [AccountsMatch, true, false]
+      FailMessage: "Account mismatch. Do you need to switch accounts?"
+
+  BasicLambdaFunctionIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  FailFalseLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.handler"
+      Role: !GetAtt BasicLambdaFunctionIamRole.Arn
+      Runtime: "python3.7"
+      Code:
+        ZipFile: |
+          from botocore.vendored import requests
+          import json
+          def handler(event, context):
+              try:
+                  boolean = json.loads(event["ResourceProperties"].get("Boolean", "false"))
+              except json.decoder.JSONDecodeError:
+                  boolean = False
+              status = "SUCCESS" if boolean or event["RequestType"] == "Delete" else "FAILED"
+              message = None if status == "SUCCESS" else event["ResourceProperties"].get("FailMessage")
+              response = requests.put(event['ResponseURL'],
+                                      json={
+                                          "Status": status,
+                                          "StackId": event['StackId'],
+                                          "RequestId": event['RequestId'],
+                                          "LogicalResourceId": event['LogicalResourceId'],
+                                          "PhysicalResourceId": f"""{event['LogicalResourceId']}-{status}""",
+                                          **({"Reason": message} if message is not None else {}),
+                                      })
+              response.raise_for_status()
+              return response.text
+
+Outputs:
+  ArtifactS3Bucket:
+    Value: !Ref ArtifactS3Bucket
+    Export:
+      Name: !Sub ${Environment}:Pipeline:ArtifactS3Bucket
